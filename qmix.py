@@ -3,24 +3,14 @@
 
 # QMix applied to pommerman
 
-# In[2]:
-
-
 import random
 from collections import namedtuple
 import numpy as np
 from copy import deepcopy
 
-
-# In[3]:
-
-
 import pommerman
-from pommerman import agents
+from pommerman.agents import BaseAgent, SimpleAgent
 from pommerman import constants
-
-
-# In[4]:
 
 
 import torch
@@ -29,300 +19,8 @@ from torch import optim
 from torch.nn import functional as F
 
 
-# In[5]:
 
-
-from IPython.core.debugger import set_trace
-
-
-# In[6]:
-
-
-def featurize(obs):
-    """Returns a tensor of size 11x11x18"""
-    # TODO: history of n moves?
-    board = obs['board']
-
-    # convert board items into bitmaps
-    maps = [board == i for i in range(10)]
-    maps.append(obs['bomb_blast_strength'])
-    maps.append(obs['bomb_life'])
-
-    # duplicate ammo, blast_strength and can_kick over entire map
-    maps.append(np.full(board.shape, obs['ammo']))
-    maps.append(np.full(board.shape, obs['blast_strength']))
-    maps.append(np.full(board.shape, obs['can_kick']))
-
-    # add my position as bitmap
-    position = np.zeros(board.shape)
-    position[obs['position']] = 1
-    maps.append(position)
-
-    # add teammate
-    if obs['teammate'] is not None:
-        maps.append(board == obs['teammate'].value)
-    else:
-        maps.append(np.zeros(board.shape))
-
-    # add enemies
-    enemies = [board == e.value for e in obs['enemies']]
-    maps.append(np.any(enemies, axis=0))
-
-    out = np.stack(maps, axis=2) 
-    # transpose to CxHxW
-    return out.transpose((2, 0, 1))
-
-
-# In[7]:
-
-
-Transition = namedtuple('Transition',
-                        ('state', 'actions', 'next_state', 'rewards', 'done'))
-
-class ReplayMemory:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
-    
-    def push(self, *args):
-        """Saves a transition"""
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = Transition(*args)
-        self.position = (self.position + 1) % self.capacity
-    
-    def push_episode(self, episode):
-        for transition in episode:
-            self.push(*transition)
-    
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
-    
-    def __len__(self):
-        return len(self.memory)
-
-
-# In[8]:
-
-
-def generate_episode(env, render=False):
-    state, done = env.reset(), False
-    episode = []
-    while not done:
-        if render:
-            env.render()
-        actions = env.act(state)
-        next_state, rewards, done, info = env.step(actions)
-        episode.append(Transition(state, actions, next_state, rewards, done))
-        state = next_state
-    return episode
-
-
-# In[9]:
-
-
-def episode_stats(env, episode):
-    """Collects statistics from episode
-    For now, only about actions taken"""
-    
-    from collections import Counter
-    action_counter = {}
-    for idx in range(len(env._agents)):
-        action_counter[idx] = Counter()
-    for transition in episode:
-        for idx, action in enumerate(transition.actions):
-            action_counter[idx][list(constants.Action)[action].name] += 1
-    return {'actions': action_counter}
-
-
-# https://github.com/starry-sky6688/StarCraft
-
-# In[10]:
-
-
-class QMixAgent(agents.BaseAgent):
-    def __init__(self, agent_idx):
-        super().__init__()
-        self.index = agent_idx
-        self.epsilon = 1.0
-        self.model  = QMixModel().to(args.device)
-        self.target = QMixModel().to(args.device)
-        self.sync_models()
-        self.optimizer = optim.Adam(self.model.parameters(),
-                                    lr=args.lr)
-        self.mode = 'train' # 'train' or 'eval'
-    
-    def __repr__(self):
-        return f'QMix{self.index}'
-    
-    __str__ = __repr__
-    
-    def set_mode(self, mode):
-        assert mode in ['train', 'eval'], f"Mode {mode} not allowed"
-        self.mode = mode
-    
-    def sync_models(self):
-        self.target.load_state_dict(self.model.state_dict())
-        
-    def update(self, batch):
-        self.mode = 'train'
-        states, actions, next_states, rewards, dones = list(zip(*batch))
-        obs      = [state[self.index] for state in states]
-        actions  = [action[self.index] for action in actions]
-        next_obs = [state[self.index] for state in next_states]
-        rewards  = torch.tensor([reward[self.index] for reward in rewards]).float().to(args.device)
-        dones    = torch.tensor(dones).float().to(args.device)
-        
-        q_vals  = self.model([featurize(o) for o in obs])
-        qa_vals = q_vals[range(len(obs)), actions]
-        
-        q_vals  = self.target([featurize(o) for o in next_obs])
-        q_vals_max, _ = torch.max(q_vals, dim=1)
-        td_error = rewards + (1-dones) * args.gamma * q_vals_max - qa_vals
-        
-        self.model.zero_grad()
-        loss = torch.mean(td_error**2)
-        loss.backward()
-        self.optimizer.step()
-        
-        return loss.item()
-    
-    def _update_epsilon(self):
-        self.epsilon *= args.eps_decay 
-        self.epsilon = max(args.eps_min, self.epsilon)
-        
-    def act(self, obs, action_space):
-        if self.mode == 'train':
-            self._update_epsilon()
-            if np.random.random() < self.epsilon:
-                return np.random.choice(constants.Action).value
-            else:
-                Qs = self.model([featurize(obs)])
-                return torch.argmax(Qs).item()
-        elif self.mode == 'eval':
-            Qs = self.model([featurize(obs)])
-            return torch.argmax(Qs).item()
-        else:
-            raise ValueError(f'Invalid mode: {self.mode}')
-
-
-# In[11]:
-
-
-class QMixModel(nn.Module):
-    def __init__(self, h=11, w=11, c=18, outputs=len(constants.Action)):
-        super().__init__()
-        # input is batch of tensors of size 11x11x18
-        self.conv1 = nn.Conv2d(in_channels=c, out_channels=64,
-                               kernel_size=5, stride=1)
-        self.conv2 = nn.Conv2d(in_channels=64, out_channels=128,
-                               kernel_size=5, stride=1)
-        
-        def conv2d_size_out(size, kernel_size=5, stride=1):
-            return (size - (kernel_size - 1) -1) // stride + 1
-        
-        convw = conv2d_size_out(conv2d_size_out(w))
-        convh = conv2d_size_out(conv2d_size_out(h))
-        linear_input_size = convw * convh * 128
-        
-        self.fc  = nn.Linear(linear_input_size, linear_input_size)
-        self.out = nn.Linear(linear_input_size, outputs)
-    
-    def forward(self, obs):
-        if isinstance(obs, list):
-            x = torch.from_numpy(np.array(obs)).float().to(args.device)
-        else:
-            x = torch.from_numpy(obs).float().to(args.device)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.view(x.size(0), -1)
-        return self.out(x).to(args.device)
-
-
-# In[12]:
-
-
-def train(env, training_agents, n_steps=10000): 
-    buffer = ReplayMemory(capacity=args.buffer_size)
-    state, done = env.reset(), False
-    running_loss = None
-    for step_idx in range(n_steps):
-        actions = env.act(state)
-        next_state, rewards, done, info = env.step(actions)
-        buffer.push(state, actions, next_state, rewards, done)
-        if len(buffer) < args.min_train_size:
-            continue
-        batch = buffer.sample(args.batch_size)
-        for agent in training_agents:
-            loss = agent.update(batch)
-            running_loss = loss if running_loss is None else args.alpha*running_loss + (1-args.alpha)*loss
-            if args.verbose and step_idx % args.print_interval == 0:
-                print(f"Step {step_idx:3d} - Agent {agent}: loss = {running_loss:.5f}")
-    return
-
-
-# In[13]:
-
-
-def eval(env, training_agents, n_episodes=10):
-    "Generates n_episodes episodes and returns average final reward for all training agents"
-    for agent in training_agents:
-        agent.set_mode('eval')
-    rewards = [generate_episode(env)[-1].rewards for _ in range(n_episodes)]
-    agent_reward = {}
-    for agent in training_agents:
-        agent_reward[agent] = sum([reward[agent.index] for reward in rewards])/n_episodes
-    return agent_reward
-
-
-# In[14]:
-
-
-def runner():
-    training_agents = [QMixAgent(0)]
-    other_agents    = [agents.SimpleAgent()]
-    agent_list = training_agents + other_agents
-    env = pommerman.make('PommeFFACompetition-v0', agent_list)
-    for epoch in range(args.n_epochs):
-        train(env, training_agents, n_steps=args.n_steps)
-        rewards = eval(env, training_agents)
-        print(f"Epoch {epoch:3d} - Wins = {rewards}")
-        stats   = episode_stats(env, generate_episode(env, render=False))
-        for agent in training_agents:
-            print('\t', agent, ' : ', stats['actions'][agent.index])
-
-
-# In[15]:
-
-
-class args:
-    buffer_size    = int(10e4)
-    min_train_size = 100
-    batch_size     = 64
-    gamma          = 0.9
-    lr             = 0.001
-    alpha          = 0.9
-    print_interval = 20
-    n_epochs       = 50
-    n_steps        = 200
-    verbose        = False
-    eps_decay      = 1 - 10e-9
-    eps_min        = 0.05
-    device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f'Using device {device}')
-
-
-# In[16]:
-
-
-# runner()
-
-
-# In[35]:
-
-
-class QMix:
+class QMix: # policy
     def __init__(self, args):
         self.args = args
         self.n_actions = args.n_actions
@@ -330,8 +28,8 @@ class QMix:
         self.state_shape = args.state_shape
         self.obs_shape = args.obs_shape
         input_shape  = self.obs_shape
-        #input_shape += self.n_actions # add last action to agent network input
-        #input_shape += self.n_agents  # reuse agent network for all agents (-> weight sharing)
+        input_shape += self.n_actions # add last action to agent network input
+        input_shape += self.n_agents  # reuse agent network for all agents (-> weight sharing)
         
         self.eval_rnn = RNN(input_shape, args)   # the agent network that produces Q_a(.)
         self.target_rnn = RNN(input_shape, args)
@@ -447,10 +145,6 @@ class QMix:
         self.eval_hidden = torch.zeros((episode_num, self.n_agents, self.args.rnn_hidden_dim))
         self.target_hidden = torch.zeros((episode_num, self.n_agents, self.args.rnn_hidden_dim))
 
-
-# In[37]:
-
-
 class RNN(nn.Module):
     # Because all the agents share the same network, input_shape=obs_shape+n_actions+n_agents
     def __init__(self, input_shape, args):
@@ -469,9 +163,6 @@ class RNN(nn.Module):
         return q, h
 
 
-# In[38]:
-
-
 class QMixNet(nn.Module):
     def __init__(self, args):
         super(QMixNet, self).__init__()
@@ -481,7 +172,7 @@ class QMixNet(nn.Module):
         # first output vector of length n_row*n_cols and convert it to matrix
         self.hyper_w1 = nn.Linear(args.state_shape, args.n_agents * args.qmix_hidden_dim)
         self.hyper_w2 = nn.Linear(args.state_shape, args.qmix_hidden_dim)
-        self.hyper_b1 = nn.Linear(args.state_shape, args.qmix_hidden)
+        self.hyper_b1 = nn.Linear(args.state_shape, args.qmix_hidden_dim)
         self.hyper_b2 = nn.Sequential(nn.Linear(args.state_shape, args.qmix_hidden_dim),
                                       nn.ReLU(),
                                       nn.Linear(args.qmix_hidden_dim, 1))
@@ -508,9 +199,6 @@ class QMixNet(nn.Module):
         q_total = torch.bmm(hidden, w2) + b2  # (1920, 1, 1)
         q_total = q_total.view(episode_num, -1, 1)  # (32, 60, 1)
         return q_total
-
-
-# In[33]:
 
 
 class Agents:
@@ -578,40 +266,11 @@ class Agents:
         return max_episode_len
         
 
-
-# In[19]:
-
-
-def featurize_state(env):
-    """Returns a tensor of size n_agentsx11x11x18"""
-    outs = []
-    for obs in env.get_observations():
-        outs.append(featurize(obs))
-        
-    # convert board items into bitmaps
-    maps = [board == i for i in range(10)] # returns list of 10 arrays, for each type 0..9
-
-    outs = np.stack(outs, axis=0)
-    return outs
-
-
-# In[20]:
-
-
-training_agents = [QMixAgent(0)]
-other_agents    = [agents.SimpleAgent()]
-agent_list = training_agents + other_agents
-env = pommerman.make('PommeFFACompetition-v0', agent_list)
-
-
-# In[21]:
-
-
 class RolloutWorker:
     def __init__(self, env, agents, args):
         self.env = env
         self.agents   = agents
-        self.n_agents = len(agents)
+        self.n_agents = args.n_agents
         
         self.args = args
         self.epsilon = args.epsilon
@@ -640,7 +299,8 @@ class RolloutWorker:
             actions, avail_actions, actions_onehot = [], [], []
             for agent_id in range(self.n_agents):
                 avail_action = self.env.get_avail_agent_actions(agent_id)
-                action = self.agents.choose_action(obs[agent_id], last_action[agent_id], agent_id,
+                action = self.agents.choose_action(obs[agent_id].flatten(),
+                                                   last_action[agent_id], agent_id,
                                                    avail_action, epsilon, evaluate)
                 # generate onehot vector of th action
                 action_onehot = np.zeros(self.args.n_actions)
@@ -717,17 +377,23 @@ class RolloutWorker:
         
         return episode, episode_reward, win_tag
 
+class QMixAgent:
+    def __init__(self, controller):
+        assert isinstance(controller, Agents), f'Wrong controller type: {type(controller)}'
+        self.controller = controller
+    
+    def act(self, obs):
 
-# In[22]:
 
 
 class Environment: # wrapper for pommerman environment
     def __init__(self, type='PommeFFACompetition-v0'):
-        self.agents = [QMixAgent(0)]
+        self.agents = [Agents(args)]
         self.n_agents = len(self.agents)
-        self.opponents   = [agents.SimpleAgent()]
-        agent_list = self.agents + self.opponents
+        self.opponents   = [SimpleAgent()]
+        agent_list = [BaseAgent() for _ in range(self.n_agents)] + self.opponents
         self.env = pommerman.make(type, agent_list)
+        self.env.training_agents = 
         self.env.reset()
         self.n_actions = self.env.action_space.n
     
@@ -792,8 +458,8 @@ class Environment: # wrapper for pommerman environment
         """
         observations = self.env.get_observations()
         for idx, opponent in enumerate(self.opponents):
-            action = self.opponent.act(observations[self.n_agents+idx], self.env.action_space)
-            actions += action
+            action = opponent.act(observations[self.n_agents+idx], self.env.action_space)
+            actions += [action]
         _, reward, done, _ = env.step(actions)
         info = {}
         if done:
@@ -806,43 +472,6 @@ class Environment: # wrapper for pommerman environment
     
     def close(self):
         self.env.close()
-
-
-# In[27]:
-
-
-class args:
-    buffer_size    = int(10e4)
-    min_train_size = 100
-    batch_size     = 64
-    gamma          = 0.9
-    lr             = 0.001
-    alpha          = 0.9
-    print_interval = 20
-    n_epochs       = 50
-    n_steps        = 200
-    verbose        = False
-    epsilon        = 1.0
-    eps_decay      = 1 - 10e-9
-    eps_min        = 0.05
-    episode_limit  = 100
-    n_actions      = len(pommerman.constants.Action)
-    state_shape    = (1, 18, 11, 11)
-    obs_shape      = (18, 11, 11)
-    device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f'Using device {device}')
-
-
-# In[36]:
-
-
-env = Environment()
-args.n_agents = env.n_agents
-row = RolloutWorker(env, Agents(args), args)
-row.generate_episode()
-
-
-# In[18]:
 
 
 class Runner:
@@ -891,12 +520,36 @@ class Runner:
             if win_tag:
                 win_number += 1
         return (win_number / self.args.evaluate_epochs,                episode_rewards / self.args.evaluate_epochs)
-            
 
+#
+class args:
+    buffer_size    = int(10e4)
+    min_train_size = 100
+    batch_size     = 64
+    gamma          = 0.9
+    lr             = 0.001
+    alpha          = 0.9
+    print_interval = 20
+    n_epochs       = 50
+    n_steps        = 200
+    verbose        = False
+    epsilon        = 1.0
+    eps_decay      = 1 - 10e-9
+    eps_min        = 0.05
+    episode_limit  = 100
+    n_actions      = len(pommerman.constants.Action)
+    n_agents       = 1
+    obs_shape      = 18 * 11 * 11
+    state_shape    = n_agents * obs_shape
+    rnn_hidden_dim = 64
+    qmix_hidden_dim = 64
+    device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f'Using device {device}')       
 
-# In[19]:
-
-
-runner = Runner()
-runner.run(0)
+if __name__ == '__main__':
+    env = Environment()
+    print(env.get_agents())
+    row = RolloutWorker(env, Agents(args), args)
+    episode = row.generate_episode()
+    print(episode)
 
