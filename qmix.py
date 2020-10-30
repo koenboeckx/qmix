@@ -270,9 +270,15 @@ class RolloutWorker:
     def __init__(self, env, agents, args):
         self.env = env
         self.agents   = agents
-        self.n_agents = args.n_agents
+        #self.n_agents = args.n_agents # TODO: get back to this
+        
+        self.agent_idxs = [0] # !! list of training agents -> integrate in args
+        self.n_agents = len(self.agent_idxs)
         
         self.args = args
+        self.obs_shape = args.obs_shape
+        self.state_shape = args.state_shape
+        self.n_actions = args.n_actions
         self.epsilon = args.epsilon
         self.episode_limit = args.episode_limit
         
@@ -287,6 +293,7 @@ class RolloutWorker:
         
         terminated = False
         step = 0
+        episode_reward = 0 # Cumulative reward over episode
         last_action = np.zeros((self.args.n_agents, self.args.n_actions))
         self.agents.policy.init_hidden(1)
         
@@ -297,7 +304,7 @@ class RolloutWorker:
             obs = self.env.get_observations()
             state = self.env.get_state()
             actions, avail_actions, actions_onehot = [], [], []
-            for agent_id in range(self.n_agents):
+            for agent_id in self.agent_idxs:
                 avail_action = self.env.get_avail_agent_actions(agent_id)
                 action = self.agents.choose_action(obs[agent_id].flatten(),
                                                    last_action[agent_id], agent_id,
@@ -315,23 +322,27 @@ class RolloutWorker:
             win_tag = True if terminated and 'battle_won' in info and info['battle_won'] else False
             
             # store all results 
-            o.append(obs)
-            s.append(state)
-            u.append(np.reshape(actions, [self.n_agents, 1]))
+            ## TODO: only store for training_agents !!
+            o.append(np.stack([o.flatten() for o in obs]))
+            s.append(np.stack([s.flatten() for s in state]))
+            #u.append(np.reshape(actions, [self.n_agents, 1]))
+            u.append(np.reshape([actions[idx] for idx in self.agent_idxs],
+                                [self.n_agents, 1]))
+            
             u_onehot.append(actions_onehot)
             avail_u.append(avail_actions)
             r.append([reward])
             terminate.append([terminated])
             padded.append([0.])
-            episode_reward += reward
+            episode_reward += reward[self.agent_idxs[0]] # reward for first training agent
             step += 1
             # ? epsilon decay update ?
             #if self.args.epsilon_anneal_scale == 'step':
             #    epsilon = epsilon - self.anneal_epsilon if epsilon > self.min_epsilon else epsilon
         
         # last obs
-        o.append(obs)
-        s.append(state)
+        o.append(np.stack([o.flatten() for o in obs]))
+        s.append(np.stack([s.flatten() for s in state]))
         o_next = o[1:]
         s_next = s[1:]
         o = o[:-1]
@@ -373,7 +384,7 @@ class RolloutWorker:
                       )
         # add episode dim
         for key in episode.keys():
-            episode[key] = np.array([episode[key]])
+            episode[key] = np.array(episode[key])
         
         return episode, episode_reward, win_tag
 
@@ -383,6 +394,7 @@ class QMixAgent:
         self.controller = controller
     
     def act(self, obs):
+        pass
 
 
 
@@ -393,7 +405,7 @@ class Environment: # wrapper for pommerman environment
         self.opponents   = [SimpleAgent()]
         agent_list = [BaseAgent() for _ in range(self.n_agents)] + self.opponents
         self.env = pommerman.make(type, agent_list)
-        self.env.training_agents = 
+        self.env.training_agents = None
         self.env.reset()
         self.n_actions = self.env.action_space.n
     
@@ -460,7 +472,7 @@ class Environment: # wrapper for pommerman environment
         for idx, opponent in enumerate(self.opponents):
             action = opponent.act(observations[self.n_agents+idx], self.env.action_space)
             actions += [action]
-        _, reward, done, _ = env.step(actions)
+        _, reward, done, _ = self.env.step(actions)
         info = {}
         if done:
             if reward == 1:
@@ -543,7 +555,9 @@ class args:
     state_shape    = n_agents * obs_shape
     rnn_hidden_dim = 64
     qmix_hidden_dim = 64
-    device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    ## TODO: IMPORTANT: correct this:
+    # device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device          = torch.device("cpu")
     print(f'Using device {device}')       
 
 if __name__ == '__main__':
