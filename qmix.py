@@ -4,12 +4,13 @@
 # QMix applied to pommerman
 
 import random
+import os
 from collections import namedtuple
 import numpy as np
 from copy import deepcopy
 
 import pommerman
-from pommerman.agents import BaseAgent, SimpleAgent
+from pommerman.agents import BaseAgent, SimpleAgent, RandomAgent
 from pommerman import constants
 
 
@@ -18,6 +19,7 @@ from torch import nn
 from torch import optim
 from torch.nn import functional as F
 
+from replay_buffer import MyReplayBuffer as ReplayBuffer
 
 
 class QMix: # policy
@@ -27,13 +29,14 @@ class QMix: # policy
         self.n_agents  = args.n_agents
         self.state_shape = args.state_shape
         self.obs_shape = args.obs_shape
+        self.model_dir = args.model_dir
         input_shape  = self.obs_shape
         input_shape += self.n_actions # add last action to agent network input
         input_shape += self.n_agents  # reuse agent network for all agents (-> weight sharing)
         
         self.eval_rnn = RNN(input_shape, args)   # the agent network that produces Q_a(.)
         self.target_rnn = RNN(input_shape, args)
-        self.eval_qmix_net = QMixNet(args)       # the mixer netwok Qtot = f(Q1, ..., Qn, state)
+        self.eval_qmix_net = QMixNet(args)       # the mixer network Qtot = f(Q1, ..., Qn, state)
         self.target_qmix_net = QMixNet(args)
         
         # copy weigths from eval to target networks
@@ -47,7 +50,7 @@ class QMix: # policy
         self.target_hidden = None
         print('Initialized QMix')
     
-    def learn(self, max_episode_len, train_step, epsilon=None):
+    def learn(self, batch, max_episode_len, train_step, epsilon=None):
         """
         In learning, the extracted data is four-dimensional, and the four dimensions
         are:
@@ -73,7 +76,7 @@ class QMix: # policy
         # Get the Q value corresponding to each agent, the dimension is (number of episodes, max_episode_len, n_agents, n_actions)
         q_evals, q_targets = self.get_q_values(batch, max_episode_len)
         # select q_vals for u = actions taken + remove unneeded dimension
-        q_evals = torch.gather(q_evals, dim=3, index=u).squeeze(3)
+        q_evals = torch.gather(q_evals, dim=3, index=u.long()).squeeze(3)
         
         # get target_q by maximizing - first, set q[unavail_action] = 0
         q_targets[avail_u_next == 0.0] = -99999
@@ -91,7 +94,7 @@ class QMix: # policy
         loss =(masked_td_error ** 2).sum() / mask.sum()
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm(self.eval_parameters, self.args.grad_norm_clip)
+        torch.nn.utils.clip_grad_norm_(self.eval_parameters, self.args.grad_norm_clip)
         self.optimizer.step()
         
         if train_step > 0 and train_step % self.args.target_update_cycle == 0:
@@ -101,19 +104,23 @@ class QMix: # policy
     def _get_inputs(self, batch, transition_idx):
         """Get all obs, next_obs and actions (as onehot vector) at
         transition_idx (over all episodes in batch)"""
-        obs, obs_next, u_onehot = batch['o'][:, transition_idx],                                   batch['o_next'][:, transition_idx],                                   batch['u_onehot'][:]
+        obs         = batch['o'][:, transition_idx]
+        obs_next    = batch['o_next'][:, transition_idx]
+        u_onehot    = batch['u_onehot'][:]
+
         episode_num = obs.shape[0]
         inputs, inputs_next = [], []
         inputs.append(obs)
         inputs_next.append(obs_next)
-        if self.args.last_action:   # whether to use the last action to choose action
-            if transition_idx == 0:  # for first experience, previous action is zero vector
-                inputs.append(torch.zeros_like(u_onehot[:, transition_idx]))
-            else:
-                inputs.append(u_onehot[:, transition_idx - 1])
-            inputs_next.append(u_onehot[:, transition_idx])
-        if self.args.reuse_network: # weight sharing: whether to use one network for all agents
-            pass
+        # add last action:
+        if transition_idx == 0:  # for first experience, previous action is zero vector
+            inputs.append(torch.zeros_like(u_onehot[:, transition_idx]))
+        else:
+            inputs.append(u_onehot[:, transition_idx - 1])
+        inputs_next.append(u_onehot[:, transition_idx])
+        # reuse_network: # weight sharing: whether to use one network for all agents
+        inputs.append(torch.eye(self.args.n_agents).unsqueeze(0).expand(episode_num, -1, -1))
+        inputs_next.append(torch.eye(self.args.n_agents).unsqueeze(0).expand(episode_num, -1, -1))
         
         # transform inputs to episode_num x n_agents x ....
         inputs = torch.cat([x.reshape(episode_num * self.args.n_agents, -1) for x in inputs], dim=1)
@@ -144,6 +151,13 @@ class QMix: # policy
     def init_hidden(self, episode_num):
         self.eval_hidden = torch.zeros((episode_num, self.n_agents, self.args.rnn_hidden_dim))
         self.target_hidden = torch.zeros((episode_num, self.n_agents, self.args.rnn_hidden_dim))
+    
+    def save_model(self, train_step):
+        num = str(train_step // self.args.save_cycle)
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
+        torch.save(self.eval_qmix_net.state_dict(), self.model_dir + '/' + num + '_qmix_net_params.pkl')
+        torch.save(self.eval_rnn.state_dict(),  self.model_dir + '/' + num + '_rnn_net_params.pkl')
 
 class RNN(nn.Module):
     # Because all the agents share the same network, input_shape=obs_shape+n_actions+n_agents
@@ -208,6 +222,7 @@ class Agents:
         self.state_shape = args.state_shape
         self.obs_shape = args.obs_shape
         self.policy = QMix(args)
+        self.args = args
         print('Initialized Agents')
     
     def choose_action(self, obs, last_action, agent_num, avail_actions, epsilon, evaluate=False):
@@ -247,15 +262,14 @@ class Agents:
         # different episodes have different lengths, so we need to get max length of the batch
         max_episode_len = self._get_max_episode_len(batch)
         for key in batch.keys():
-            if key != 'z': # TODO: what is 'z'? -> MAVEN
-                batch[key] = batch[key][:, :max_episode_len]
+            batch[key] = batch[key][:, :max_episode_len]
         self.policy.learn(batch, max_episode_len, train_step)
         if train_step > 0 and train_step % self.args.save_cycle == 0:
             self.policy.save_model(train_step)
     
     def _get_max_episode_len(self, batch):
         terminated = batch['terminated']
-        episode_num = terminated_shape[0] # number of episode in batch
+        episode_num = terminated.shape[0] # number of episode in batch
         max_episode_len = 0
         for episode_idx in range(episode_num):
             for transition_idx in range(self.args.episode_limit):
@@ -270,10 +284,8 @@ class RolloutWorker:
     def __init__(self, env, agents, args):
         self.env = env
         self.agents   = agents
-        #self.n_agents = args.n_agents # TODO: get back to this
-        
-        self.agent_idxs = [0] # !! list of training agents -> integrate in args
-        self.n_agents = len(self.agent_idxs)
+        self.agent_idxs = args.agent_idxs
+        self.n_agents = len(self.agent_idxs)        
         
         self.args = args
         self.obs_shape = args.obs_shape
@@ -282,7 +294,7 @@ class RolloutWorker:
         self.epsilon = args.epsilon
         self.episode_limit = args.episode_limit
         
-        print('Init RolloutWorker')
+        print('Initialized RolloutWorker')
         
     def generate_episode(self, episode_num=None, evaluate=False):
         o, u, r, s, avail_u, u_onehot, terminate, padded = [], [], [], [], [], [], [], []
@@ -313,7 +325,7 @@ class RolloutWorker:
                 action_onehot = np.zeros(self.args.n_actions)
                 action_onehot[action] = 1
                 
-                actions.append(action)
+                actions.append(action.item())
                 actions_onehot.append(action_onehot)
                 avail_actions.append(avail_action)
                 last_action[agent_id] = action_onehot
@@ -324,7 +336,8 @@ class RolloutWorker:
             # store all results 
             ## TODO: only store for training_agents !!
             o.append(np.stack([o.flatten() for o in obs]))
-            s.append(np.stack([s.flatten() for s in state]))
+            #s.append(np.stack([s.flatten() for s in stenv.agents # TODO: check if we don't need env.agents[:]ate]))
+            s.append(state.flatten())
             #u.append(np.reshape(actions, [self.n_agents, 1]))
             u.append(np.reshape([actions[idx] for idx in self.agent_idxs],
                                 [self.n_agents, 1]))
@@ -334,7 +347,7 @@ class RolloutWorker:
             r.append([reward])
             terminate.append([terminated])
             padded.append([0.])
-            episode_reward += reward[self.agent_idxs[0]] # reward for first training agent
+            episode_reward += reward # reward for first training agent
             step += 1
             # ? epsilon decay update ?
             #if self.args.epsilon_anneal_scale == 'step':
@@ -342,7 +355,8 @@ class RolloutWorker:
         
         # last obs
         o.append(np.stack([o.flatten() for o in obs]))
-        s.append(np.stack([s.flatten() for s in state]))
+        #s.append(np.stack([s.flatten() for s in state]))
+        s.append(state.flatten())
         o_next = o[1:]
         s_next = s[1:]
         o = o[:-1]
@@ -399,12 +413,17 @@ class QMixAgent:
 
 
 class Environment: # wrapper for pommerman environment
-    def __init__(self, type='PommeFFACompetition-v0'):
-        self.agents = [Agents(args)]
-        self.n_agents = len(self.agents)
-        self.opponents   = [SimpleAgent()]
+    def __init__(self, env_type, args):
+        assert env_type in ['PommeFFACompetition-v0'], f'Environment type {env_type} unknown'     
+
+        self.n_agents = args.n_agents
+        self.agents_idxs = args.agent_idxs
+
+        #TODO : make this dynamic (# of opponts depends on game type)
+        self.opponents = [SimpleAgent() for _ in range(args.n_opponents)]
+        #self.opponents = [RandomAgent() for _ in range(args.n_opponents)]
         agent_list = [BaseAgent() for _ in range(self.n_agents)] + self.opponents
-        self.env = pommerman.make(type, agent_list)
+        self.env = pommerman.make(env_type, agent_list)
         self.env.training_agents = None
         self.env.reset()
         self.n_actions = self.env.action_space.n
@@ -442,10 +461,7 @@ class Environment: # wrapper for pommerman environment
         out = np.stack(maps, axis=2) 
         # transpose to CxHxW
         return out.transpose((2, 0, 1))
-    
-    def get_agents(self):
-        return self.agents
-    
+
     def get_state(self):
         # returns state = np.array of size n_agents x 18x11x11
         return np.stack(self.get_observations())
@@ -473,26 +489,27 @@ class Environment: # wrapper for pommerman environment
             action = opponent.act(observations[self.n_agents+idx], self.env.action_space)
             actions += [action]
         _, reward, done, _ = self.env.step(actions)
+        reward = reward[self.agents_idxs[0]] # reward for first agent of team
         info = {}
         if done:
-            if reward == 1:
+            if  reward == 1: 
                 info = {'battle_won': True}
             elif reward == -1:
                 info = {'battle_won': False}
         return reward, done, info
         
-    
     def close(self):
         self.env.close()
 
 
 class Runner:
-    def __init__(self, env, args):
+    def __init__(self, args):
         self.args = args
-        self.env = pommerman.make('PommeFFACompetition-v0', agent_list)
-        self.agents = Agents(env)
+        env = Environment('PommeFFACompetition-v0', args)
+        self.agents = Agents(args)
         
-        self.rollout_worker = RolloutWorker()
+        self.rollout_worker = RolloutWorker(env, self.agents, args)
+        self.buffer = ReplayBuffer(args)
         
         self.win_rates = []
         self.episode_rewards = []
@@ -506,22 +523,16 @@ class Runner:
                 self.win_rates.append(win_rate)
                 self.episode_rewards.append(episode_reward)
                 # self.plt(num)
-            
-            episodes = []
+
             for episode_idx in range(self.args.n_episodes):
                 episode, _, _ = self.rollout_worker.generate_episode(episode_idx)
-                episodes.append(episode)
-            episode_batch = episodes.pop(0)
-            for episode in episodes:
-                for key in episode_batch.keys(): # TODO: what does this do?
-                    episode_batch[key] = np.concatenate((episode_batch[key], episode[key]),
-                                                        axis=0)
-                self.buffer.store_episode(episode_batch)
-                for train_step in range(self.args.train_steps):
-                    # train_steps: to indicate when to sync eval and target models
-                    mini_batch = self.buffer.sample(min(self.buffer.current_size, self.args.batch_size))
-                    self.agents.train(mini_batch, train_steps)
-                    train_steps += 1
+                self.buffer.store_episode(episode)
+
+            for train_step in range(self.args.train_steps):
+                # train_steps: to indicate when to sync eval and target models
+                mini_batch = self.buffer.sample(min(self.buffer.current_size, self.args.batch_size))
+                self.agents.train(mini_batch, train_steps)
+                train_steps += 1
     
     def evaluate(self):
         win_number = 0
@@ -531,26 +542,33 @@ class Runner:
             episode_rewards += episode_reward
             if win_tag:
                 win_number += 1
-        return (win_number / self.args.evaluate_epochs,                episode_rewards / self.args.evaluate_epochs)
+        return (win_number / self.args.evaluate_epochs, \
+                episode_rewards / self.args.evaluate_epochs)
 
 #
 class args:
-    buffer_size    = int(10e4)
-    min_train_size = 100
-    batch_size     = 64
-    gamma          = 0.9
-    lr             = 0.001
-    alpha          = 0.9
-    print_interval = 20
-    n_epochs       = 50
-    n_steps        = 200
+    lr             = 0.01
+    gamma          = 0.99
+    grad_norm_clip = 0.1 # TODO: find convenient value
+    target_update_cycle = 5 # TODO: find convenient value
+    save_cycle     = 100 # TODO: find convenient value
+    model_dir      = './models/'
+    buffer_size    = 100
+    batch_size     = 32
+    n_epochs       = 2
+    evaluate_cycle = 10
+    evaluate_epochs = 1
+    n_episodes     = 100
+    train_steps    = 200
     verbose        = False
     epsilon        = 1.0
     eps_decay      = 1 - 10e-9
     eps_min        = 0.05
-    episode_limit  = 100
+    episode_limit  = 77
     n_actions      = len(pommerman.constants.Action)
-    n_agents       = 1
+    n_agents       = 2
+    agent_idxs     = range(n_agents)  # list of training agents
+    n_opponents    = 2
     obs_shape      = 18 * 11 * 11
     state_shape    = n_agents * obs_shape
     rnn_hidden_dim = 64
@@ -560,10 +578,21 @@ class args:
     device          = torch.device("cpu")
     print(f'Using device {device}')       
 
+# -------------------------------------------------------------------------------
+def test_environment(args):
+    env = Environment('PommeFFACompetition-v0', args)
+    rollout_worker = RolloutWorker(env, Agents(args), args)
+    episode, episode_reward, win_tag = rollout_worker.generate_episode()
+    for key in episode.keys():
+        print(f"{key} : {episode[key].shape}")
+    print(episode_reward, win_tag)
+
 if __name__ == '__main__':
-    env = Environment()
-    print(env.get_agents())
-    row = RolloutWorker(env, Agents(args), args)
-    episode = row.generate_episode()
-    print(episode)
+    runner = Runner(args)
+    for run in range(10):
+        runner.run(run)
+        win_rate, _ = runner.evaluate()
+        print(f'Win rate: {win_rate}')
+    
+
 
