@@ -574,8 +574,8 @@ class args:
     rnn_hidden_dim = 64
     qmix_hidden_dim = 64
     ## TODO: IMPORTANT: correct this:
-    # device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    device          = torch.device("cpu")
+    device         = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    #device          = torch.device("cpu")
     print(f'Using device {device}')       
 
 # -------------------------------------------------------------------------------
